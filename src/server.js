@@ -1,5 +1,6 @@
 const express = require("express");
 const mongoose = require("mongoose");
+require("dotenv").config();
 const uploadRoute = require("./routes/upload");
 
 const app = express();

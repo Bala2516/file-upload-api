@@ -6,12 +6,18 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const BitcoinData = require("../models/BitcoinData");
+const AudioFile = require("../models/AudioFile");
+const VideoFile = require("../models/VideoFile");
 
 const router = express.Router();
 
 const ALGO = "aes-256-cbc";
-const SECRET_KEY = crypto.randomBytes(32);
+const SECRET_KEY = Buffer.from(process.env.AES_SECRET_KEY, "hex");
 const IV_LENGTH = 16;
+
+const MAX_MEDIA_SIZE = 10 * 1024 * 1024; // 10MB
+const AUDIO_EXTS = [".mp3"];
+const VIDEO_EXTS = [".mp4"];
 
 function encryptFile(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
@@ -116,58 +122,127 @@ function parseTickerSentiment(str) {
 }
 
 // Upload Route
-router.post("/upload", upload.single("file"), async (req, res) => {
+router.post("/upload", upload.array("files", 10), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ msg: "No file uploaded" });
-
-    if (req.file.size === 0) {
-      return res.status(400).json({ msg: "Uploaded file is empty" });
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ msg: "No files uploaded" });
     }
 
-    const filePath = req.file.path;
-    const encryptedPath = filePath + ".enc";
+    const username = req.body.username || "UnknownUser";
+    const results = [];
 
-    const ext = path.extname(req.file.originalname).toLowerCase();
-    let jsonData = [];
+    for (const file of req.files) {
+      const ext = path.extname(file.originalname).toLowerCase();
+      const filePath = file.path;
+      const encryptedPath = filePath + ".enc";
 
-    // Detect file type & parse
-    if (ext === ".csv") {
-      jsonData = await parseCSV(req.file.path);
-    } else if (ext === ".xls" || ext === ".xlsx") {
-      jsonData = parseExcel(req.file.path);
-    } else {
-      return res.status(400).json({ msg: "Only CSV or Excel files allowed" });
+      if (file.size === 0) {
+        results.push({
+          file: file.originalname,
+          status: "error",
+          message: "File is empty",
+        });
+        continue;
+      }
+
+      if (AUDIO_EXTS.includes(ext) || VIDEO_EXTS.includes(ext)) {
+
+        if (file.size > MAX_MEDIA_SIZE) {
+          fs.unlinkSync(file.path);
+          results.push({
+            file: file.originalname,
+            status: "error",
+            message: "Audio/Video size must be less than 10MB",
+          });
+          continue;
+        }
+
+        let savedDoc;
+
+        if (AUDIO_EXTS.includes(ext)) {
+          savedDoc = await AudioFile.create({
+            filename: file.filename,
+            original_name: file.originalname,
+            filepath: filePath,
+            size: file.size,
+            uploaded_by: username,
+          });
+        } else {
+          savedDoc = await VideoFile.create({
+            filename: file.filename,
+            original_name: file.originalname,
+            filepath: filePath,
+            size: file.size,
+            uploaded_by: username,
+          });
+        }
+
+        await encryptFile(filePath, encryptedPath);
+        fs.unlinkSync(filePath);
+
+        results.push({
+          file: file.originalname,
+          type: AUDIO_EXTS.includes(ext) ? "audio" : "video",
+          status: "success",
+          model_id: savedDoc._id,
+          encrypted_file: path.basename(encryptedPath),
+        });
+
+        continue;
+      }
+
+      let jsonData = [];
+      let fileType = "";
+
+      if (ext === ".csv") {
+        jsonData = await parseCSV(file.path);
+        fileType = "csv";
+      } else if (ext === ".xls" || ext === ".xlsx") {
+        jsonData = parseExcel(file.path);
+        fileType = "excel";
+      } else {
+        results.push({
+          file: file.originalname,
+          status: "error",
+          message: "Invalid file type",
+        });
+        continue;
+      }
+
+      if (!jsonData.length) {
+        results.push({
+          file: file.originalname,
+          status: "error",
+          message: "File contains no data",
+        });
+        continue;
+      }
+
+      jsonData = jsonData.map((row) => ({
+        ...row,
+        topics: parseTopics(row.topics),
+        ticker_sentiment: parseTickerSentiment(row.ticker_sentiment),
+      }));
+
+      const savedData = await BitcoinData.insertMany(jsonData);
+
+      await encryptFile(filePath, encryptedPath);
+      fs.unlinkSync(filePath);
+
+      results.push({
+        file: file.originalname,
+        type: fileType,
+        status: "success",
+        encrypted_file: path.basename(encryptedPath),
+        records_saved: savedData.length,
+      });
     }
-
-    if (!jsonData.length || jsonData.length === 0)
-      return res
-        .status(400)
-        .json({ msg: "File contains no data or is invalid" });
-
-    console.log("Parsed Data:", jsonData);
-
-    // Transform each record to include parsed fields
-    jsonData = jsonData.map((row) => ({
-      ...row,
-      topics: parseTopics(row.topics),
-      ticker_sentiment: parseTickerSentiment(row.ticker_sentiment),
-    }));
-
-    const savedData = await BitcoinData.insertMany(jsonData);
-
-    // Encrypt file
-    await encryptFile(filePath, encryptedPath);
-
-    // Delete original unencrypted file
-    fs.unlinkSync(filePath);
 
     res.json({
-      message: "File uploaded, encrypted & data stored",
-      encrypted_file: path.basename(encryptedPath),
-      folder: req.file.destination,
-      records_saved: savedData.length,
+      message: "All files processed",
+      total_files: req.files.length,
+      results,
     });
-
   } catch (error) {
     console.error(error);
     res.status(500).json({
